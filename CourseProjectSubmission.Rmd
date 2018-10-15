@@ -1,0 +1,188 @@
+---
+title: "Coursera CP Practical ML"
+author: "M. Adriaanse"
+date: "15 oktober 2018"
+output: html_document
+---
+
+The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har
+
+# Background
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+# Project
+## Goal
+Predict the manner in which an exercise was done.
+
+## Boundaries
+. The variable to predict is: 'classe'.
+. Any other variable may be used.
+
+## Used packages
+```{r setup, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(corrplot)
+library(caret)
+library(randomForest)
+library(e1071)
+library(nnet)
+library(parallelSVM)
+```
+
+# Data loading and exploration
+The data is stored in the ./data directory in .csv format.
+
+```{r Reading data, message=FALSE, warning=FALSE}
+# First all data is read.
+pml_training <- read_csv("./data/pml-training.csv")
+pml_testing <- read_csv("./data/pml-testing.csv")
+```
+
+The imported data has the following dimensions:
+```{r}
+dim(pml_training)
+dim(pml_testing)
+```
+
+
+A number of columns contain only character values. These columns contain (most likely) errors, that may interfere with the models. 
+
+Only the 'classe' column is saved for later, in a separate vector.
+
+To clean the data from the unwanted columns:
+```{r}
+pml_training_class <- pml_training$classe
+pml_training <- pml_training[, !sapply(pml_training, is.character)]
+pml_testing <- pml_testing[, !sapply(pml_testing, is.character)]
+
+#The number of columns should now still be equal
+dim(pml_training) == dim(pml_testing)
+```
+
+The number of columns in the testing set is smaller due to the fact that less columns with relevant data exist for the testing set with only a fraction of the obervations. This also implies that the timestamp data is not relevant.
+
+Additionally the testing set containt one column (problem_id), that is unique for that dataset. That column is removed as well.
+
+Both sets have an X1 column that was added with importing the data. This column will be removed.
+
+To remove the columns for the training set, for which there is no data in the testing set and the one unique column from the testing set:
+```{r}
+pml_testing$X1 <- NULL
+pml_testing$problem_id <- NULL
+pml_testing$raw_timestamp_part_1 <- NULL
+pml_testing$raw_timestamp_part_2 <- NULL
+columnsToKeep <- colnames(pml_testing)
+pml_training <- select(pml_training,columnsToKeep)
+
+#The number of columns should now again be equal
+dim(pml_training) == dim(pml_testing)
+```
+
+Now let's dive into some correlations.
+```{r Correlationplot}
+training_cor <- cor(pml_training)
+corrplot(training_cor, 
+         method = "square", type = "lower", diag = T,
+         outline = F, na.label = ".", na.label.col = "darkgrey",
+         tl.col = "black", tl.srt = 45, tl.cex = .5)
+```
+
+For 3 columns only NA values are returned. These values are removed from both datasets.
+```{r Cleaning Datasets}
+pml_testing$magnet_dumbbell_z <- NULL
+pml_testing$magnet_forearm_y <- NULL
+pml_testing$magnet_forearm_z <- NULL
+columnsToKeep <- colnames(pml_testing)
+pml_training <- select(pml_training,columnsToKeep)
+```
+
+Finally an overall training dataset is created by re-adding the expected outcomes (classe) back onto the cleaned data. This set is then split to create an aditional validation set. Rows with NA values are removed from the validation set, since these will not exist in the test set either.
+```{r Finalizing datasets}
+pml_training <- cbind(pml_training, classe = as.factor(pml_training_class))
+set.seed(20181014)
+val_ind <- sample(seq_len(nrow(pml_training)), size = 0.1*nrow(pml_training))
+
+pml_training <- pml_training[-val_ind,]
+pml_validation <- pml_training[val_ind,]
+
+pml_validation <- pml_validation[!rowSums(is.na(pml_validation)) > 0, ]
+```
+
+The `pml_training` data is the dataset used for fitting models.
+
+#Fitting different models
+For each different type of model an (automatically optimized) fit is generated. Then a prediction is made on the testing dataset. Before submission of the results of the applied models, the overall accuracy of each fit is evaluated in a future paragraph.
+
+##Random Forest (RF)
+To predict discrete classes from a large number of variables, a logical choice for a model family is Random Forest. tuneRF uses a blind dataset and seperatly provided outcomes to generate optimized RF-trees, based on prediction accuracy. This is used to create the first set of model fit and prediction.
+```{r Optimized randomForest, message=FALSE, warning=FALSE}
+fit_rf <- tuneRF(
+    subset(pml_training, select = -classe), pml_training$classe,
+    stepFactor = 1.5, improve = 1e-3, ntree = 225, 
+    trace = F, plot = F, doBest = T
+    )
+val_rf <- predict(fit_rf, pml_validation, type = "class")
+pred_rf <- predict(fit_rf, pml_testing, type = "class")
+```
+
+
+##Support Vector Machine (SVM)
+Another model that is expected to perform well in cases similar to this one is an SVM. We also applied 100 cross fold validations to try and increase the quality of the model. 
+```{r Optimized SVM, message=FALSE, warning=FALSE}
+fit_svm <- parallelSVM(classe ~ ., data = pml_training, 
+                       cross = 100, probability = T)
+val_svm <- predict(fit_svm, pml_validation, probability = T)
+pred_svm <- predict(fit_svm, pml_testing, probability = T)
+```
+
+##Neural Network (NNET)
+A NNET has a high level of black-box, at least without a study into its workings after training. However is may perform very well (for reasons that will then remain uninvestigated). The NNET is trained in iterations. A relatively large number of maximum iterations (5000) is chosen to allow for deep learning.
+```{r Converged Neural Net, message=FALSE, warning=FALSE}
+fit_nnet <- nnet(classe ~ ., data = pml_training, 
+                 size = 12, maxit = 5000, trace = F)
+val_nnet <- as.factor(predict(fit_nnet, pml_validation, type = "class"))
+pred_nnet <- as.factor(predict(fit_nnet, pml_testing, type = "class"))
+```
+
+The model has converged, meaning it reached the set plateau in increase of accuracy.
+
+##k-Nearest Neighbours (KNN)
+Last but not least a simple kNN is used for reference.
+```{r kNN, message=FALSE, warning=FALSE}
+fit_knn <- knn3(classe ~ ., data = pml_training, k = 1)
+val_knn <- predict(fit_knn, pml_validation, type = "class")
+pred_knn <- predict(fit_knn, pml_testing, type = "class")
+```
+
+
+#Prediction results
+Now all predictions are compared.
+
+First we look at the accuracy of the model, by comparing the confusion matrices of the validation predictions (predictions by the fitted model on the training dataset).
+```{r Confusion matrices, message=FALSE, warning=FALSE}
+conf_rf <- confusionMatrix(val_rf, pml_validation$classe)
+conf_svm <- confusionMatrix(val_svm, pml_validation$classe)
+conf_nnet <- confusionMatrix(val_nnet, pml_validation$classe)
+conf_knn <- confusionMatrix(val_knn, pml_validation$classe)
+
+#Random Forest results
+conf_rf$overall
+#Support Vector Machine results
+conf_svm$overall
+#Neural Network results
+conf_nnet$overall
+#k-Nearest Neighbours results
+conf_knn$overall
+```
+
+The RF and kNN models both achieved an Accuracy of 1, their predictions should be perfect and thus identical for the training set.
+```{r}
+all.equal(pred_rf, pred_knn, check.names = F)
+```
+
+##Conclusion
+All training data is classified. The manners in which the exercises were done are as follows.
+```{r}
+pred_rf
+```
